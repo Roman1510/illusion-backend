@@ -1,5 +1,5 @@
-from flask import Flask
-from flask_cors import CORS
+from flask import Flask # type: ignore
+from flask_cors import CORS # type: ignore
 from config import logger, TEMP_DIR
 from routes import init_routes
 

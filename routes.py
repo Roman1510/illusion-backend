@@ -1,7 +1,7 @@
-from flask import request, jsonify
+from flask import request, jsonify # type: ignore
 from image_processor import ImageProcessor
-import cv2
-import numpy as np
+import cv2 # type: ignore
+import numpy as np # type: ignore
 import os
 import base64
 import logging
