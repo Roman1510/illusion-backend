@@ -4,7 +4,7 @@ import mediapipe as mp
 from rembg import remove
 from typing import Tuple, Dict
 import logging
-import base64  # Added missing import for base64
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,10 @@ class ImageProcessor:
     def remove_background(self, image: np.ndarray) -> np.ndarray:
         """Remove the background from an image using rembg."""
         try:
-            return remove(image)
+            result = remove(image)
+            if result.shape[2] == 3:
+                result = cv2.cvtColor(result, cv2.COLOR_BGR2BGRA)
+            return result
         except Exception as e:
             logger.error(f"Error removing background: {str(e)}")
             raise
@@ -74,8 +77,9 @@ class ImageProcessor:
                 landmarks_dict["nose_tip"] = (int(landmarks[1].x * image_width), int(landmarks[1].y * image_height))
                 landmarks_dict["mouth_center"] = (int(landmarks[13].x * image_width), int(landmarks[13].y * image_height))
                 logger.info("Landmarks detected successfully")
-                if is_side_profile and landmarks_dict["nose_tip"] and landmarks_dict["right_eye"]:
-                    if landmarks_dict["nose_tip"][0] > landmarks_dict["right_eye"][0]:
+                if is_side_profile and landmarks_dict["nose_tip"]:
+                    nose_x = landmarks_dict["nose_tip"][0]
+                    if nose_x < image_width // 2:
                         landmarks_dict["orientation"] = "left"
                     else:
                         landmarks_dict["orientation"] = "right"
@@ -84,7 +88,8 @@ class ImageProcessor:
                 if is_side_profile:
                     nose_tip = self.estimate_nose_tip(image)
                     landmarks_dict["nose_tip"] = nose_tip
-                    if nose_tip[0] > image_width // 2:
+                    nose_x = nose_tip[0]
+                    if nose_x < image_width // 2:
                         landmarks_dict["orientation"] = "left"
                     else:
                         landmarks_dict["orientation"] = "right"
@@ -97,20 +102,31 @@ class ImageProcessor:
             raise
 
     def crop_to_face(self, image: np.ndarray, landmarks: Dict[str, Tuple[int, int]]) -> np.ndarray:
-        """Crop the image to the face and neck area with improved symmetry."""
+        """Crop the image to the face and neck area dynamically based on landmarks and image dimensions."""
         try:
             height, width = image.shape[:2]
             nose_tip = landmarks.get("nose_tip")
             if not nose_tip:
                 logger.warning("Nose tip not detected, returning original image")
                 return image
+
             nose_y = nose_tip[1]
-            eye_y = nose_y - 50 if landmarks.get("left_eye") is None else landmarks["left_eye"][1]
-            mouth_y = nose_y + 50 if landmarks.get("mouth_center") is None else landmarks["mouth_center"][1]
-            top = max(0, eye_y - 70)
-            bottom = min(height, mouth_y + 120)
-            left = max(0, nose_tip[0] - 150)
-            right = min(width, nose_tip[0] + 150)
+            eye_y = nose_y - int(height * 0.15) if landmarks.get("left_eye") is None else landmarks["left_eye"][1]
+            mouth_y = nose_y + int(height * 0.2) if landmarks.get("mouth_center") is None else landmarks["mouth_center"][1]
+
+            face_height = mouth_y - eye_y
+            top = max(0, eye_y - int(face_height * 0.5))
+            bottom = min(height, mouth_y + int(face_height * 1.0))
+
+            if landmarks.get("left_eye") and landmarks.get("right_eye"):
+                eye_distance = abs(landmarks["right_eye"][0] - landmarks["left_eye"][0])
+                face_width = eye_distance * 2
+            else:
+                face_width = int(width * 0.5)
+
+            left = max(0, nose_tip[0] - face_width // 2)
+            right = min(width, nose_tip[0] + face_width // 2)
+
             cropped_image = image[top:bottom, left:right]
             return cropped_image
         except Exception as e:
@@ -118,17 +134,62 @@ class ImageProcessor:
             raise
 
     def align_images(self, front_image: np.ndarray, side_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Rescale the side image to match the front image's dimensions without altering scale."""
+        """Scale images to match a common resolution while preserving aspect ratio."""
         try:
             front_height, front_width = front_image.shape[:2]
-            side_image = cv2.resize(side_image, (front_width, front_height))
+            side_height, side_width = side_image.shape[:2]
+
+            # Calculate aspect ratios
+            front_aspect = front_width / front_height
+            side_aspect = side_width / side_height
+
+            # Use the front image as the reference for target dimensions
+            target_height = front_height
+            target_width = front_width
+
+            # Scale front image if needed (typically not necessary since it's the reference)
+            if (front_width, front_height) != (target_width, target_height):
+                front_image = cv2.resize(front_image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+            # Scale side image while preserving aspect ratio
+            if side_aspect > front_aspect:
+                # Side image is wider, scale to match height
+                new_side_height = target_height
+                new_side_width = int(new_side_height * side_aspect)
+            else:
+                # Side image is taller, scale to match width
+                new_side_width = target_width
+                new_side_height = int(new_side_width / side_aspect)
+
+            side_image = cv2.resize(side_image, (new_side_width, new_side_height), interpolation=cv2.INTER_AREA)
+
+            # Handle dimensions: pad if smaller, crop if larger
+            if new_side_width < target_width or new_side_height < target_height:
+                # Pad the side image to match target dimensions
+                top_pad = max(0, (target_height - new_side_height) // 2)
+                bottom_pad = max(0, target_height - new_side_height - top_pad)
+                left_pad = max(0, (target_width - new_side_width) // 2)
+                right_pad = max(0, target_width - new_side_width - left_pad)
+                side_image = cv2.copyMakeBorder(
+                    side_image, top_pad, bottom_pad, left_pad, right_pad,
+                    cv2.BORDER_CONSTANT, value=[0, 0, 0, 0]
+                )
+            else:
+                # Crop the side image to match target dimensions
+                x_offset = max(0, (new_side_width - target_width) // 2)
+                y_offset = max(0, (new_side_height - target_height) // 2)
+                side_image = side_image[
+                    y_offset:y_offset + target_height,
+                    x_offset:x_offset + target_width
+                ]
+
             return front_image, side_image
         except Exception as e:
             logger.error(f"Error aligning images: {str(e)}")
             raise
 
     def merge_images(self, front_image: np.ndarray, side_image: np.ndarray, front_landmarks: Dict, side_landmarks: Dict) -> np.ndarray:
-        """Merge the front and side images with a clean split."""
+        """Merge the front and side images with a smooth blend based on orientation."""
         try:
             front_image = self.crop_to_face(front_image, front_landmarks)
             side_image = self.crop_to_face(side_image, side_landmarks)
@@ -137,33 +198,47 @@ class ImageProcessor:
                 front_image = cv2.cvtColor(front_image, cv2.COLOR_BGR2BGRA)
             if side_image.shape[2] == 3:
                 side_image = cv2.cvtColor(side_image, cv2.COLOR_BGR2BGRA)
+
             height, width = front_image.shape[:2]
             midline = width // 2
             merged_image = np.zeros((height, width, 4), dtype=np.uint8)
-            merged_image[:, :, 3] = 0
-            orientation = side_landmarks.get("orientation", "unknown")
+
+            orientation = side_landmarks.get("orientation", "left")  # Default to left if unknown
             if orientation == "left":
-                side_image_mirrored = cv2.flip(side_image, 1)
+                # Side profile is facing left, place on the left side
+                side_image_mirrored = side_image  # No flip needed since it's facing left
+                # Left half from side image
                 merged_image[:, :midline] = side_image_mirrored[:, :midline]
+                # Right half from front image
                 merged_image[:, midline:] = front_image[:, midline:]
+                # Blend the transition
+                blend_width = int(width * 0.05)  # Increased for smoother blending
+                for x in range(max(0, midline - blend_width), min(width, midline + blend_width)):
+                    alpha = (x - (midline - blend_width)) / (2 * blend_width)
+                    alpha = max(0, min(1, alpha))
+                    merged_image[:, x] = (
+                        (1 - alpha) * side_image_mirrored[:, x] + alpha * front_image[:, x]
+                    ).astype(np.uint8)
             elif orientation == "right":
-                merged_image[:, :midline] = side_image[:, :midline]
-                merged_image[:, midline:] = front_image[:, midline:]
-            else:
-                logger.warning("Could not determine side profile orientation, defaulting to left profile")
-                side_image_mirrored = cv2.flip(side_image, 1)
-                merged_image[:, :midline] = side_image_mirrored[:, :midline]
-                merged_image[:, midline:] = front_image[:, midline:]
-            blend_width = int(width * 0.02)
-            for x in range(max(0, midline - blend_width), min(width, midline + blend_width)):
-                alpha = (x - (midline - blend_width)) / (2 * blend_width)
-                alpha = max(0, min(1, alpha))
-                if orientation == "left":
-                    merged_image[:, x] = (1 - alpha) * side_image_mirrored[:, x] + alpha * front_image[:, x]
-                elif orientation == "right":
-                    merged_image[:, x] = (1 - alpha) * side_image[:, x] + alpha * front_image[:, x]
+                # Side profile is facing right, place on the right side
+                side_image_mirrored = side_image  # No flip needed since it's facing right
+                # Left half from front image
+                merged_image[:, :midline] = front_image[:, :midline]
+                # Right half from side image
+                merged_image[:, midline:] = side_image_mirrored[:, midline:]
+                # Blend the transition
+                blend_width = int(width * 0.05)  # Increased for smoother blending
+                for x in range(max(0, midline - blend_width), min(width, midline + blend_width)):
+                    alpha = (x - (midline - blend_width)) / (2 * blend_width)
+                    alpha = max(0, min(1, alpha))
+                    merged_image[:, x] = (
+                        (1 - alpha) * front_image[:, x] + alpha * side_image_mirrored[:, x]
+                    ).astype(np.uint8)
+
+            # Ensure transparency where no content exists
             mask = (merged_image[:, :, 3] == 0)
             merged_image[mask] = [0, 0, 0, 0]
+
             return merged_image
         except Exception as e:
             logger.error(f"Error merging images: {str(e)}")
